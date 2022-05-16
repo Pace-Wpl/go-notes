@@ -199,6 +199,8 @@ func main() {
 
 图4的流程里当执行完成后把G仍到`gfree`队列里。注意此时G并没有销毁(只重置了G的栈以及状态)，当再次创建G的时候优先从`gfree`列表里获取，这样就起到了复用G的作用，避免反复与系统交互创建内存。
 
+>`ISSUE_Q` : gfree不会立即销毁G达到复用G的效果，那么什么时候会去销毁G呢？
+
 M即启动后处于一个自循环状态，执行完一个G之后继续执行下一个G，反复上面的图2~图4过程。当第一个M正在繁忙而又有新的G需要执行时，会再开启一个M来执行。
 
 下面详细看下调度循环的实现。
@@ -339,6 +341,7 @@ func schedule() {
 		}
 	}
 	// 从其它地方获取G,如果获取不到则沉睡M，并且阻塞在这里，直到M被再次使用
+	// ISSUE_Q : M是怎么沉睡的，又是怎么唤醒的？
 	if gp == nil {
 		gp, inheritTime = findrunnable() // blocks until work is available
 	}
@@ -353,6 +356,7 @@ func schedule() {
 func runqget(_p_ *p) (gp *g, inheritTime bool) {
 	// If there's a runnext, it's the next G to run.
 	// 优先从runnext里获取一个G，如果没有则从runq里获取
+	// ISSUE_Q : runnext 看起来像是优先级G，会在什么时候放入？
 	for {
 		next := _p_.runnext
 		if next == 0 {
@@ -364,6 +368,7 @@ func runqget(_p_ *p) (gp *g, inheritTime bool) {
 	}
 
 	// 从队头获取
+	// ISSUE_ : 快速 并发 环形队列? 环形队列的长度是固定的？ ---- 长度为固定的 [256]runq *[25]guintptr
 	for {
 		h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with other consumers
 		t := _p_.runqtail
@@ -503,6 +508,7 @@ func runqput(_p_ *p, gp *g, next bool) {
 retry:
 	// 如果_p_.runq队列不满，则放到队尾就结束了。
 	// 试想如果不放到队尾而放到队头里会怎样？如果频繁的创建G则可能后面的G总是不被执行，对后面的G不公平
+	// ISSUE_Q : runnext 是具有一定优先级的，如果gp是从oldnext取出来的，放到队尾吗？
 	h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with consumers
 	t := _p_.runqtail
 	if t-h < uint32(len(_p_.runq)) {
@@ -538,6 +544,7 @@ func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
 	// 把要put的g也放进batch去
 	batch[n] = gp
 
+	// ISSUE_Q : 打乱顺序？为什么要打乱顺序？
 	if randomizeScheduler {
 		for i := uint32(1); i <= n; i++ {
 			j := fastrandn(i + 1)
@@ -634,6 +641,7 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 		......
 		
 		// 将偷到的任务转移到本地P队列里
+		// ISSUE_T : 从队头开始偷取
 		for i := uint32(0); i < n; i++ {
 			g := _p_.runq[(h+i)%uint32(len(_p_.runq))]
 			batch[(batchHead+i)%uint32(len(batch))] = g
@@ -726,6 +734,7 @@ type gobuf struct {
 }
 ```
 `gogo`方法传的参数注意是`gp.sched`,而这个结构体里可以看到保存了熟悉的函数栈寄存器`SP/PC/BP`，能想到是把执行栈传了进去(既然是执行一个G，当然要把执行栈传进去了)。可以看到在`gogo`函数中实质就只是做了函数栈指针的移动。
+>ISSUE_Q SP/PC/BP ?
 
 这个执行G的操作，熟悉**函数调用的函数栈**的基本原理的人想必有些印象(如果不熟悉请自行搜索)，执行一个G其实就是执行函数一样切换到对应的函数栈帧上。
 
@@ -825,7 +834,7 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason s
 	// can't do anything that might move the G between Ms here.
 	// mcall 在M里从当前正在运行的G切换到g0
 	// park_m 在切换到的g0下先把传过来的G切换为_Gwaiting状态挂起该G
-	// 调用回调函数waitunlockf()由外层决定是否等待解锁，返回true则等待解锁不在执行G，返回false则不等待解锁继续执行
+	// 调用回调函数waitunlockf()由外层决定是否等待解锁，返回true则等待解锁不再执行G，返回false则不等待解锁继续执行
 	mcall(park_m)
 }
 ```
@@ -940,6 +949,7 @@ func retake(now int64) uint32 {
 			
 		} else if s == _Prunning { // 针对正在运行的P
 			// Preempt G if it's running for too long.
+			// ISSUE_Q: 什么时候会更新_p_.schedtick？ 似乎是每分配M一个G,p.schedtick 就会+1？
 			t := int64(_p_.schedtick)
 			if int64(pd.schedtick) != t {
 				pd.schedtick = uint32(t)
@@ -980,7 +990,7 @@ func preemptone(_p_ *p) bool {
 	return true
 }
 ```
-`sysmon()`方法处于无限for循环，整个进程的生命周期监控着。`retake()`方法每次对所有的P遍历检查超过10ms的还在运行的G，如果有超过10ms的则通过`preemptone()`进行抢占，但是要注意这里只把gp.stackguard0赋值了一个`stackPreempt`，并没有做让出CPU的操作，因此这里的抢占实质只是一个”标记“抢占。那么真正停止G执行的操作在哪里？
+`sysmon()`方法处于无限for循环，整个进程的生命周期监控着。`retake()`方法每次对所有的P遍历检查超过10ms的还在运行的G，如果有超过`10ms`的则通过`preemptone()`进行抢占，但是要注意这里只把gp.stackguard0赋值了一个`stackPreempt`，并没有做让出CPU的操作，因此这里的抢占实质只是一个”标记“抢占。那么真正停止G执行的操作在哪里？
 
 ```
 // runtime/stack.go
@@ -1004,6 +1014,7 @@ func newstack(ctxt unsafe.Pointer) {
 		
 		// 停止当前运行状态的G,最后放到全局runq里,释放M
 		// 这里会进入schedule循环.阻塞到这里
+		// ISSUE_Q: gopreempt_m() 的实现？
 		gopreempt_m(gp) // never return
 	}
 
@@ -1022,6 +1033,7 @@ func goschedImpl(gp *g) {
 	casgstatus(gp, _Grunning, _Grunnable)
 	dropg()
 	lock(&sched.lock)
+	// ISSUE_T: 被抢占的g会放到全局runq
 	globrunqput(gp)
 	unlock(&sched.lock)
 
@@ -1029,6 +1041,7 @@ func goschedImpl(gp *g) {
 }
 ```
 我们都知道Go的调度是非抢占式的，要想实现G不被长时间，就只能主动触发抢占，而Go触发抢占的实际就是在栈扩张的时候，在`newstack`新创建栈空间的时候检测是否有抢占标记(也就是`gp.stackguard0`是否等于`stackPreempt`)，如果有则通过`goschedImpl`方法再次进入到熟悉的`schedule`调度循环。
+>ISSUE_Q:`newstack`在什么情况下会被调用？(即是G在什么时候会被抢占？)
 
 ### 系统调用让出CPU
 
@@ -1136,6 +1149,7 @@ func exitsyscall0(gp *g) {
 		stoplockedm()
 		execute(gp, false) // Never returns.
 	}
+	// ISSUE_Q: 没有空闲的P，执行stopm()?
 	stopm()
 	schedule() // Never returns. // 没有P资源执行，就继续下一轮调度循环
 }
@@ -1168,6 +1182,7 @@ func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr
 	// 如果没有空闲G则新建一个,默认堆大小为_StackMin=2048 bytes
 	if newg == nil {
 		newg = malg(_StackMin)
+		// ISSUE_T: goroutine 状态机
 		casgstatus(newg, _Gidle, _Gdead)
 		// 把新创建的G添加到全局allg里
 		allgadd(newg) // publishes with a g->status of Gdead so GC scanner doesn't look at uninitialized stack.
@@ -1182,6 +1197,7 @@ func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr
 	casgstatus(newg, _Gdead, _Grunnable)
 
 	// 把G放到P里的待运行队列，第三参数设置为true，表示要放到runnext里，作为优先要执行的G
+	// ISSUE_T : runnext = true
 	runqput(_p_, newg, true)
 
 	// 如果有其它空闲P则尝试唤醒某个M来执行
@@ -1505,6 +1521,7 @@ func ready(gp *g, traceskip int, next bool) {
 在上面的方法里可以看到先把休眠的G从`_Gwaiting`切换到`_Grunnable`状态，表明已经可运行。然后通过`runqput`方法把G放到P的待运行队列里，就进入到调度器的调度循环里了。
 
 总结：time.Sleep想要进入阻塞(休眠)状态，其实是通过`gopark`方法给自己标记个`_Gwaiting`状态，然后把自己所占用的CPU线程资源给释放出来，继续执行调度任务，调度其它的G来运行。而唤醒是通过把G更改回`_Grunnable`状态后，然后把G放入到P的待运行队列里等待执行。通过这点还可以看出休眠中的G其实并不占用CPU资源，最多是占用内存，是个很轻量级的阻塞。
+>ISSUE_T: 重要方法记录-> `gopark`--goroutine暂停 ;; `goready`--goroutine唤醒(放到P.runq) ;; `systemstack`--系统执行？？
 
 ### sync.Mutex
 
