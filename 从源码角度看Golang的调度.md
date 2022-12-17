@@ -199,7 +199,7 @@ func main() {
 
 图4的流程里当执行完成后把G仍到`gfree`队列里。注意此时G并没有销毁(只重置了G的栈以及状态)，当再次创建G的时候优先从`gfree`列表里获取，这样就起到了复用G的作用，避免反复与系统交互创建内存。
 
->`ISSUE_Q` : gfree不会立即销毁G达到复用G的效果，那么什么时候会去销毁G呢？
+>`ISSUE_Q` : gfree不会立即销毁G达到复用G的效果，那么什么时候会去销毁G呢？------如果 P 本地队列中 gFree 超过 64 个，仅会在 P 本地队列中保存 32 个，把超过的 G 都放入到全局闲置队列 sched.gFree,而sched.gFree会在每次GC的时候进行释放-->`runtime->mgcmark.go->markrootFreeGStacks()`
 
 M即启动后处于一个自循环状态，执行完一个G之后继续执行下一个G，反复上面的图2~图4过程。当第一个M正在繁忙而又有新的G需要执行时，会再开启一个M来执行。
 
@@ -356,7 +356,7 @@ func schedule() {
 func runqget(_p_ *p) (gp *g, inheritTime bool) {
 	// If there's a runnext, it's the next G to run.
 	// 优先从runnext里获取一个G，如果没有则从runq里获取
-	// ISSUE_Q : runnext 看起来像是优先级G，会在什么时候放入？
+	// ISSUE_Q : runnext 看起来像是优先级G，会在什么时候放入？------创建G的时候会优先放入runnext
 	for {
 		next := _p_.runnext
 		if next == 0 {
@@ -368,7 +368,7 @@ func runqget(_p_ *p) (gp *g, inheritTime bool) {
 	}
 
 	// 从队头获取
-	// ISSUE_ : 快速 并发 环形队列? 环形队列的长度是固定的？ ---- 长度为固定的 [256]runq *[25]guintptr
+	// ISSUE_T : 快速 并发 环形队列? 环形队列的长度是固定的？ ---- 长度为固定的 [256]runq *[25]guintptr  lock-free实现（CAS）
 	for {
 		h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with other consumers
 		t := _p_.runqtail
@@ -508,7 +508,7 @@ func runqput(_p_ *p, gp *g, next bool) {
 retry:
 	// 如果_p_.runq队列不满，则放到队尾就结束了。
 	// 试想如果不放到队尾而放到队头里会怎样？如果频繁的创建G则可能后面的G总是不被执行，对后面的G不公平
-	// ISSUE_Q : runnext 是具有一定优先级的，如果gp是从oldnext取出来的，放到队尾吗？
+	// ISSUE_Q : runnext 是具有一定优先级的，如果gp是从oldnext取出来的，放到队尾吗？------是的，直接放到队尾，每个新建的goruotine先放到runnext，原来的runnext都是从队尾入队
 	h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with consumers
 	t := _p_.runqtail
 	if t-h < uint32(len(_p_.runq)) {
@@ -734,7 +734,7 @@ type gobuf struct {
 }
 ```
 `gogo`方法传的参数注意是`gp.sched`,而这个结构体里可以看到保存了熟悉的函数栈寄存器`SP/PC/BP`，能想到是把执行栈传了进去(既然是执行一个G，当然要把执行栈传进去了)。可以看到在`gogo`函数中实质就只是做了函数栈指针的移动。
->ISSUE_Q SP/PC/BP ?
+>ISSUE_Q SP/PC/BP ?------ SP(stack pointer),BP(base pointer),PC(Program Couner)别名1:指令指针(Instruction Pointer)IP---https://www.jianshu.com/p/6050dde9a9d9
 
 这个执行G的操作，熟悉**函数调用的函数栈**的基本原理的人想必有些印象(如果不熟悉请自行搜索)，执行一个G其实就是执行函数一样切换到对应的函数栈帧上。
 
@@ -1182,7 +1182,8 @@ func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr
 	// 如果没有空闲G则新建一个,默认堆大小为_StackMin=2048 bytes
 	if newg == nil {
 		newg = malg(_StackMin)
-		// ISSUE_T: goroutine 状态机
+		// ISSUE_T: goroutine 状态机:(_Gidle;_Grunnable;_Grunning;_Gsyscall;_Gwaiting;_Gmoribund_unused;
+		// _Gdead;_Genqueue_unused;_Gcopystack;_Gpreempted;_Gscan...) runtime->runtime2.go->const
 		casgstatus(newg, _Gidle, _Gdead)
 		// 把新创建的G添加到全局allg里
 		allgadd(newg) // publishes with a g->status of Gdead so GC scanner doesn't look at uninitialized stack.
@@ -1521,7 +1522,7 @@ func ready(gp *g, traceskip int, next bool) {
 在上面的方法里可以看到先把休眠的G从`_Gwaiting`切换到`_Grunnable`状态，表明已经可运行。然后通过`runqput`方法把G放到P的待运行队列里，就进入到调度器的调度循环里了。
 
 总结：time.Sleep想要进入阻塞(休眠)状态，其实是通过`gopark`方法给自己标记个`_Gwaiting`状态，然后把自己所占用的CPU线程资源给释放出来，继续执行调度任务，调度其它的G来运行。而唤醒是通过把G更改回`_Grunnable`状态后，然后把G放入到P的待运行队列里等待执行。通过这点还可以看出休眠中的G其实并不占用CPU资源，最多是占用内存，是个很轻量级的阻塞。
->ISSUE_T: 重要方法记录-> `gopark`--goroutine暂停 ;; `goready`--goroutine唤醒(放到P.runq) ;; `systemstack`--系统执行？？
+>ISSUE_T: 重要方法记录-> `gopark`--goroutine暂停 ;; `goready`--goroutine唤醒(放到P.runq) ;; `systemstack`--系统执行？？ `mcall`--切换到G0;;
 
 ### sync.Mutex
 
